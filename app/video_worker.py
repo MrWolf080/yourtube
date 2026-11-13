@@ -8,7 +8,7 @@ import signal
 import subprocess
 import threading
 import time
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 from psycopg.rows import dict_row
@@ -103,10 +103,14 @@ class Pipeline:
 
 
 def finish(db, video_id, token, directory, staging, duration):
+    if duration is not None:
+        for name in ("video.mp4", "preview.jpg"):
+            with (staging / name).open("rb") as result:
+                os.fsync(result.fileno())
     with db.transaction():
         row = db.execute("""
             SELECT id FROM videos WHERE id=%s AND status='processing' AND lease_token=%s
-            AND lease_until > now() FOR UPDATE
+            AND lease_until > clock_timestamp() FOR UPDATE
         """, (video_id, token)).fetchone()
         if not row:
             raise JobLost
@@ -117,8 +121,6 @@ def finish(db, video_id, token, directory, staging, duration):
             """, (ERROR, video_id))
         else:
             for name in ("video.mp4", "preview.jpg"):
-                with (staging / name).open("rb") as result:
-                    os.fsync(result.fileno())
                 (staging / name).replace(directory / name)
             fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
             try:
@@ -133,11 +135,9 @@ def finish(db, video_id, token, directory, staging, duration):
 
 def process(db, video_id, token, attempt):
     directory = MEDIA / str(video_id)
-    staging = directory / ".processing"
+    staging = directory / f".processing-{token}"
     source = directory / "source"
     try:
-        if staging.exists():
-            shutil.rmtree(staging)
         duration = None
         if attempt <= ATTEMPTS:
             try:
@@ -150,9 +150,12 @@ def process(db, video_id, token, attempt):
         finish(db, video_id, token, directory, staging, duration)
     except JobLost:
         log.info("Video job cancelled or lease lost: %s", video_id)
+        return
     finally:
-        if staging.exists():
+        try:
             shutil.rmtree(staging)
+        except FileNotFoundError:
+            pass
     trim_terminal_files(db, video_id)
 
 
@@ -165,8 +168,20 @@ def trim_terminal_files(db, video_id):
         if not row:
             return
         (directory / "source").unlink(missing_ok=True)
-        if (directory / ".processing").exists():
-            shutil.rmtree(directory / ".processing")
+        # Terminal jobs have no current lease. Only remove known staging paths.
+        for staging in directory.glob(".processing*"):
+            if staging.name != ".processing":
+                token = staging.name.removeprefix(".processing-")
+                try:
+                    if str(UUID(token)) != token:
+                        continue
+                except ValueError:
+                    continue
+            if staging.is_dir() and not staging.is_symlink():
+                try:
+                    shutil.rmtree(staging)
+                except FileNotFoundError:
+                    pass
         if row["status"] == "failed":
             for name in ("video.mp4", "preview.jpg"):
                 (directory / name).unlink(missing_ok=True)
