@@ -9,7 +9,7 @@ services:
       POSTGRES_USER: yourtube
       POSTGRES_PASSWORD: ${YOURTUBE_DB_PASSWORD:?Run bash deploy.sh to generate .env}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ./postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "yourtube", "-d", "yourtube"]
       interval: 3s
@@ -28,7 +28,7 @@ services:
       PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
     volumes:
-      - video_data:/data/media
+      - ./video_data:/data/media
     ports:
       - "${YOURTUBE_BIND:-0.0.0.0}:${YOURTUBE_PORT:-8000}:8000"
     healthcheck:
@@ -37,7 +37,4 @@ services:
       timeout: 4s
       retries: 15
 
-volumes:
-  postgres_data:
-  video_data:
 
