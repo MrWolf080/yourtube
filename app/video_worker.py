@@ -15,7 +15,9 @@ from fastapi import HTTPException
 import psycopg
 from psycopg.rows import dict_row
 
-from app.main import DATABASE_URL, MEDIA, clean_pending_media, pool, sweep_uploads, video_lock
+from app.main import (
+    DATABASE_URL, MEDIA, STORAGE_SWEEP_INTERVAL, clean_pending_media, pool, sweep_uploads, video_lock,
+)
 from app.video_processing import ERROR, prepare_video
 
 LEASE = 30
@@ -198,6 +200,7 @@ def trim_terminal_files(db, video_id):
 
 
 def worker_loop(stop, maintenance=False):
+    next_sweep = 0
     while not stop.is_set():
         try:
             with psycopg.connect(DATABASE_URL, autocommit=True, row_factory=dict_row,
@@ -206,7 +209,6 @@ def worker_loop(stop, maintenance=False):
                 while not stop.is_set():
                     if maintenance and time.monotonic() >= next_cleanup:
                         clean_pending_media()
-                        sweep_uploads()
                         terminal = db.execute("""
                             SELECT id FROM videos WHERE status IN ('ready','failed')
                             AND cleanup_pending ORDER BY id LIMIT 40
@@ -216,6 +218,9 @@ def worker_loop(stop, maintenance=False):
                                 if video_lock(db, row["id"]):
                                     trim_terminal_files(db, row["id"])
                         next_cleanup = time.monotonic() + 30
+                    if maintenance and time.monotonic() >= next_sweep:
+                        next_sweep = time.monotonic() + STORAGE_SWEEP_INTERVAL
+                        sweep_uploads()
                     for slot in range(2):
                         if db.execute("SELECT pg_try_advisory_lock(%s,%s) AS locked",
                                       (SLOT_NAMESPACE, slot)).fetchone()["locked"]:

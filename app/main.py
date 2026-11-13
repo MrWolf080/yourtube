@@ -34,6 +34,8 @@ UPLOAD_SLOTS = 2
 UPLOAD_COOLDOWN = 60
 UPLOAD_RECEIVE_TIMEOUT = 300
 STALE_UPLOAD_AGE = 24 * 60 * 60
+STORAGE_SWEEP_INTERVAL = 60 * 60
+STORAGE_SWEEP_BATCH = 500
 UPLOAD_LOCK_NAMESPACE = 910207441
 CATEGORIES = ("Кино", "Природа", "Путешествия", "Музыка", "Технологии", "Другое")
 COOKIE = "yourtube_session"
@@ -327,28 +329,51 @@ def sweep_temporary_uploads():
                 logging.getLogger("uvicorn.error").exception("Could not remove stale upload %s", path.name)
 
 
-def sweep_uploads():
-    sweep_temporary_uploads()
-    cutoff = time.time() - 3600
+def sweep_orphan_batch(candidates, cutoff):
     with pool.connection() as db:
-        for path in MEDIA.iterdir():
-            try:
-                if not path.is_dir() or path.stat().st_mtime >= cutoff:
+        ids = list(candidates)
+        known = {row["id"] for row in db.execute("""
+            SELECT id FROM videos WHERE id = ANY(%s)
+            UNION SELECT video_id FROM pending_video_deletions WHERE video_id = ANY(%s)
+        """, (ids, ids))}
+    for video_id in candidates.keys() - known:
+        path = candidates[video_id]
+        try:
+            with pool.connection() as db:
+                if not video_lock(db, video_id):
                     continue
-                try:
-                    video_id = UUID(path.name)
-                except ValueError:
-                    continue
-                if str(video_id) != path.name or path.is_symlink() or not video_lock(db, video_id):
-                    continue
+                # A publication or deletion may have committed after the batch lookup.
                 exists = db.execute("""
                     SELECT id FROM videos WHERE id=%s
                     UNION ALL SELECT video_id FROM pending_video_deletions WHERE video_id=%s
                 """, (video_id, video_id)).fetchone()
-                if not exists:
+                if not exists and not path.is_symlink() and path.stat().st_mtime < cutoff:
                     shutil.rmtree(path)
-            except FileNotFoundError:
+        except FileNotFoundError:
+            continue
+        except OSError:
+            logging.getLogger("uvicorn.error").exception("Could not remove orphan media %s", video_id)
+
+
+def sweep_uploads():
+    cutoff = time.time() - 3600
+    candidates = {}
+    with os.scandir(MEDIA) as entries:
+        for entry in entries:
+            try:
+                video_id = UUID(entry.name)
+                if str(video_id) != entry.name or not entry.is_dir(follow_symlinks=False):
+                    continue
+                if entry.stat(follow_symlinks=False).st_mtime >= cutoff:
+                    continue
+            except (ValueError, FileNotFoundError):
                 continue
+            candidates[video_id] = Path(entry.path)
+            if len(candidates) == STORAGE_SWEEP_BATCH:
+                sweep_orphan_batch(candidates, cutoff)
+                candidates.clear()
+    if candidates:
+        sweep_orphan_batch(candidates, cutoff)
 
 
 def upload_slot(request: Request, user=Depends(signed_in)):
@@ -543,10 +568,13 @@ def clean_pending_media():
 
 
 async def retry_media_cleanup():
+    next_sweep = time.monotonic() + STORAGE_SWEEP_INTERVAL
     while True:
         try:
             await run_in_threadpool(clean_pending_media)
-            await run_in_threadpool(sweep_temporary_uploads)
+            if time.monotonic() >= next_sweep:
+                next_sweep = time.monotonic() + STORAGE_SWEEP_INTERVAL
+                await run_in_threadpool(sweep_temporary_uploads)
         except Exception:
             logging.getLogger("uvicorn.error").exception("Could not retry media cleanup")
         await asyncio.sleep(30)
