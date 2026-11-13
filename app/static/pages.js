@@ -42,7 +42,8 @@ async function watch(id, current) {
     try {
       const row = await api(url + "/views", "POST");
       if (current()) $("#views").textContent = number(row.views);
-      player.removeEventListener("timeupdate", reportView);
+      if (row.accepted) player.removeEventListener("timeupdate", reportView);
+      else reportingView = false;
     } catch {
       reportingView = false;
     }
@@ -156,6 +157,7 @@ async function manage(id, current) {
       <button type="button" id="delete-video" class="button danger">Удалить видео</button>
     </div></div>
     <div id="processing-status" class="panel access" role="status">${v.status === "ready" ? "Видео опубликовано" : "Получение статуса…"}</div>
+    <button type="button" id="retry-video" class="button access" hidden>Повторить обработку</button>
     <form id="edit" class="panel stack form-wide">${metaFields(v)}<button class="button primary">Сохранить</button></form>
     <section class="panel form-wide access"><h2>Доступ к приватному видео</h2>
       <form id="grant" class="inline"><label>Имя пользователя<input name="handle" pattern="[A-Za-z0-9_]{3,30}" required></label><button class="button">Разрешить</button></form>
@@ -168,7 +170,7 @@ async function manage(id, current) {
       const panel = $("#processing-status");
       panel.hidden = false;
       panel.textContent = ({
-        queued: "Видео ожидает обработки",
+        queued: status.error ? "Ожидается повторная обработка. " + status.error : "Видео ожидает обработки",
         processing: "Обработка видео — " + status.progress + "%",
         ready: "Видео опубликовано",
         failed: status.error || "Не удалось обработать видео"
@@ -178,13 +180,23 @@ async function manage(id, current) {
         render();
         return;
       }
-      if (status.status === "failed") return;
+      $("#retry-video").hidden = !status.can_retry;
     } catch (error) {
       if (!current() || error.status === 404 || error.status === 401) return;
     }
     setTimeout(() => { if (current()) pollStatus(); }, 1500);
   }
   if (v.status !== "ready") pollStatus();
+  bind("#retry-video", "click", async e => {
+    const button = e.currentTarget;
+    button.disabled = true;
+    try {
+      await api(url + "/retry", "POST");
+      if (current()) render();
+    } finally {
+      button.disabled = false;
+    }
+  });
   bind("#delete-video", "click", async e => {
     if (!confirm("Удалить видео и связанные комментарии? Это действие нельзя отменить.")) return;
     const button = e.currentTarget;

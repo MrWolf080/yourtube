@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import hmac
 import logging
 import os
 import secrets
@@ -41,10 +42,12 @@ CATEGORIES = ("Кино", "Природа", "Путешествия", "Музы�
 PUBLIC_ORIGIN = os.environ.get("PUBLIC_ORIGIN", "").rstrip("/")
 COOKIE_SECURE = PUBLIC_ORIGIN.startswith("https://") or os.environ.get("COOKIE_SECURE") == "1"
 COOKIE = "yourtube_session"
-VIEWER_COOKIE = "yourtube_viewer"
+PLAYBACK_TOKEN_AGE = 900
 cookie = APIKeyCookie(name=COOKIE, auto_error=False)
 passwords = PasswordHasher()
 DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql:///yourtube")
+PLAYBACK_KEY = hashlib.sha256((os.environ.get("PLAYBACK_SECRET") or
+                               os.environ.get("DATABASE_URL") or secrets.token_hex(32)).encode()).digest()
 pool = ConnectionPool(
     DATABASE_URL,
     kwargs={"row_factory": dict_row}, min_size=1, max_size=8, open=False,
@@ -463,15 +466,44 @@ async def upload(request: Request, title: Title, description: str = Query("", ma
 def video_status(video_id: UUID, user=Depends(signed_in)):
     with pool.connection() as db:
         row = db.execute("""
-            SELECT id AS video_id,status,progress,error FROM videos WHERE id=%s AND owner_id=%s
+            SELECT id AS video_id,status,progress,error,cleanup_pending FROM videos WHERE id=%s AND owner_id=%s
         """, (video_id, user["id"])).fetchone()
     if not row:
         fail(404, "Видео не найдено")
+    cleanup_pending = row.pop("cleanup_pending")
+    row["can_retry"] = row["status"] == "failed" and not cleanup_pending and (MEDIA / str(video_id) / "source").is_file()
     return row
 
 
+@app.post("/api/videos/{video_id}/retry", tags=["Видео"], status_code=202)
+def retry_video(video_id: UUID, user=Depends(signed_in)):
+    with pool.connection() as db:
+        if not video_lock(db, video_id):
+            fail(409, "Очистка файлов ещё не завершена. Повторите позже.")
+        video = owner_video(db, video_id, user)
+        if video["status"] != "failed" or video["cleanup_pending"]:
+            fail(409, "Видео пока нельзя отправить на повторную обработку.")
+        source = MEDIA / str(video_id) / "source"
+        if not source.is_file():
+            fail(409, "Исходный файл недоступен. Загрузите видео заново.")
+        reserved = source.stat().st_size + MAX_OUTPUT + MAX_PREVIEW
+        db.execute("SELECT pg_advisory_xact_lock(910207444)")
+        usage = db.execute("""
+            SELECT coalesce(sum(reserved_bytes),0) +
+                (SELECT coalesce(sum(reserved_bytes),0) FROM pending_video_deletions) AS total
+            FROM videos WHERE id <> %s
+        """, (video_id,)).fetchone()["total"]
+        if usage + reserved + UPLOAD_SLOTS * LIMIT > MEDIA_QUOTA:
+            fail(507, "Хранилище видео заполнено")
+        db.execute("""
+            UPDATE videos SET status='queued', progress=0, error=NULL, attempts=0,
+                retry_at=now() + interval '10 seconds', reserved_bytes=%s WHERE id=%s
+        """, (reserved, video_id))
+    return {"video_id": video_id, "status": "queued"}
+
+
 @app.get("/api/videos/{video_id}", tags=["Видео"])
-def get_video(video_id: UUID, request: Request, response: Response, user=Depends(session_user)):
+def get_video(video_id: UUID, user=Depends(session_user)):
     uid = viewer_id(user)
     with pool.connection() as db:
         video = video_for(db, video_id, user)
@@ -481,20 +513,66 @@ def get_video(video_id: UUID, request: Request, response: Response, user=Depends
             (SELECT count(*) FROM subscriptions WHERE channel_id=%s) AS subscribers,
             EXISTS(SELECT 1 FROM subscriptions WHERE channel_id=%s AND user_id=%s) AS subscribed
         """, (video_id, video_id, uid, video["owner_id"], video["owner_id"], uid)).fetchone())
-        if not request.cookies.get(VIEWER_COOKIE):
-            response.set_cookie(VIEWER_COOKIE, secrets.token_urlsafe(32), httponly=True,
-                                samesite="lax", secure=COOKIE_SECURE,
-                                max_age=365 * 86400)
         return video
+
+def playback_viewer(request, user):
+    if user:
+        return f"user:{user['id']}"
+    ip = client_ip(request)
+    if ip != "unknown":
+        return "guest:" + hmac.digest(PLAYBACK_KEY, f"ip:{ip}".encode(), "sha256").hex()
+    return None
+
+
+def playback_signature(video_id, viewer, started):
+    message = f"playback:{video_id}:{viewer}:{started}".encode()
+    return hmac.digest(PLAYBACK_KEY, message, "sha256").hex()
+
+
+def playback_started(request, video_id, viewer):
+    cookie = request.cookies.get("playback_" + video_id.hex, "")
+    started, _, signature = cookie.partition(".")
+    if not viewer or not started.isascii() or not started.isdecimal() or len(started) > 13:
+        return None
+    if not hmac.compare_digest(playback_signature(video_id, viewer, started).encode(), signature.encode()):
+        return None
+    age = time.time() - int(started) / 1000
+    return age if 0 <= age <= PLAYBACK_TOKEN_AGE else None
+
+
+class PlaybackResponse(FileResponse):
+    def __init__(self, path, request, video_id, viewer):
+        super().__init__(path, media_type="video/mp4")
+        self.request = request
+        self.video_id = video_id
+        self.viewer = viewer
+
+    async def __call__(self, scope, receive, send):
+        async def send_with_playback_cookie(message):
+            if (message["type"] == "http.response.start" and message["status"] in (200, 206)
+                    and self.viewer and playback_started(self.request, self.video_id, self.viewer) is None):
+                started = str(int(time.time() * 1000))
+                signature = playback_signature(self.video_id, self.viewer, started)
+                response = Response()
+                response.set_cookie("playback_" + self.video_id.hex, f"{started}.{signature}",
+                                    max_age=PLAYBACK_TOKEN_AGE, httponly=True, secure=COOKIE_SECURE,
+                                    samesite="lax", path=f"/api/videos/{self.video_id}")
+                message["headers"] = list(message["headers"]) + [
+                    item for item in response.raw_headers if item[0] == b"set-cookie"
+                ]
+            await send(message)
+
+        await super().__call__(scope, receive, send_with_playback_cookie)
+
 
 @app.post("/api/videos/{video_id}/views", tags=["Видео"])
 def count_view(video_id: UUID, request: Request, user=Depends(session_user)):
     with pool.connection() as db:
         video = video_for(db, video_id, user)
-        browser = request.cookies.get(VIEWER_COOKIE, "")
-        if not user and not 32 <= len(browser) <= 128:
-            return {"views": video["views"]}
-        viewer = f"user:{user['id']}" if user else f"browser:{digest(browser)}"
+        viewer = playback_viewer(request, user)
+        age = playback_started(request, video_id, viewer)
+        if age is None or age < min(3, max(0.25, video["duration"] / 2)):
+            return {"views": video["views"], "accepted": False}
         # Serialize eligibility and deduplication with concurrent updates to this video.
         uid = viewer_id(user)
         video = db.execute(f"""
@@ -514,9 +592,9 @@ def count_view(video_id: UUID, request: Request, user=Depends(session_user)):
                 WHERE video_id=%s AND viewer=%s
             """, (video_id, viewer))
         if counted:
-            return db.execute("UPDATE videos SET views=views+1 WHERE id=%s RETURNING views",
-                              (video_id,)).fetchone()
-        return video
+            video = db.execute("UPDATE videos SET views=views+1 WHERE id=%s RETURNING views",
+                               (video_id,)).fetchone()
+        return {**video, "accepted": True}
 
 
 def serve_media(video_id, user, filename, mime):
@@ -528,8 +606,9 @@ def serve_media(video_id, user, filename, mime):
     return FileResponse(path, media_type=mime)
 
 @app.get("/api/videos/{video_id}/stream", tags=["Видео"], response_class=FileResponse)
-def stream(video_id: UUID, user=Depends(session_user)):
-    return serve_media(video_id, user, "video.mp4", "video/mp4")
+def stream(video_id: UUID, request: Request, user=Depends(session_user)):
+    response = serve_media(video_id, user, "video.mp4", "video/mp4")
+    return PlaybackResponse(response.path, request, video_id, playback_viewer(request, user))
 
 @app.get("/api/videos/{video_id}/preview", tags=["Видео"], response_class=FileResponse)
 def preview(video_id: UUID, user=Depends(session_user)):
@@ -569,6 +648,20 @@ def clean_pending_media():
         clean_deleted_media(row["video_id"])
 
 
+def clean_guest_receipts():
+    with pool.connection() as db:
+        db.execute("""
+            WITH expired AS (
+                SELECT video_id,viewer FROM video_view_receipts
+                WHERE (viewer LIKE 'guest:%' OR viewer LIKE 'browser:%')
+                  AND viewed_at <= now() - interval '24 hours'
+                ORDER BY viewed_at LIMIT 10000 FOR UPDATE SKIP LOCKED
+            )
+            DELETE FROM video_view_receipts r USING expired
+            WHERE r.video_id=expired.video_id AND r.viewer=expired.viewer
+        """)
+
+
 async def retry_media_cleanup():
     next_sweep = time.monotonic() + STORAGE_SWEEP_INTERVAL
     while True:
@@ -577,6 +670,7 @@ async def retry_media_cleanup():
             if time.monotonic() >= next_sweep:
                 next_sweep = time.monotonic() + STORAGE_SWEEP_INTERVAL
                 await run_in_threadpool(sweep_temporary_uploads)
+                await run_in_threadpool(clean_guest_receipts)
         except Exception:
             logging.getLogger("uvicorn.error").exception("Could not retry media cleanup")
         await asyncio.sleep(30)

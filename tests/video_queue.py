@@ -99,7 +99,14 @@ def test_worker(code):
 
 
 def release_gate(name):
-    subprocess.run(["docker", "exec", name, "touch", "/tmp/queue-gate"], check=True)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        result = subprocess.run(["docker", "exec", name, "touch", "/tmp/queue-gate"],
+                                capture_output=True)
+        if result.returncode == 0:
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"Worker gate unavailable: {result.stderr.decode()}")
 
 
 def upload_again(owner, handle, content):
@@ -168,7 +175,15 @@ def check_disk_floor(owner, handle, media):
         status = wait(owner, path, "failed")
         assert "Недостаточно места" in status["error"], status
         owner.request(path + "/stream", 404)
-        wait_for_db(f"SELECT reserved_bytes FROM videos WHERE id='{video_id(path)}'", "0")
+        job = video_id(path)
+        assert sql(f"SELECT attempts FROM videos WHERE id='{job}'") == "3"
+        wait_for_db(f"SELECT cleanup_pending FROM videos WHERE id='{job}'", "f")
+        assert int(sql(f"SELECT reserved_bytes FROM videos WHERE id='{job}'")) == len(media)
+        assert owner.request(path + "/status")["can_retry"]
+    owner.request(path + "/retry", 202, "POST")
+    with test_worker(GATED_WORKER) as (name, _):
+        release_gate(name)
+        wait(owner, path, "ready")
 
 
 def check_partial_publish(owner, handle, media):

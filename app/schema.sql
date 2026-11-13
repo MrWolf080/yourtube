@@ -116,3 +116,7 @@ ALTER TABLE pending_video_deletions ADD COLUMN IF NOT EXISTS reserved_bytes bigi
 CREATE INDEX IF NOT EXISTS videos_queue ON videos (created_at,id)
     WHERE status IN ('queued','processing');
 ALTER TABLE videos ADD COLUMN IF NOT EXISTS cleanup_pending boolean NOT NULL DEFAULT false;
+
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS retry_at timestamptz NOT NULL DEFAULT now();
+
+CREATE INDEX IF NOT EXISTS guest_view_receipts_expiry ON video_view_receipts (viewed_at) WHERE viewer LIKE 'guest:%' OR viewer LIKE 'browser:%';

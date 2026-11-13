@@ -14,17 +14,24 @@ MAX_PIXELS = 4096 * 2160
 MAX_DURATION = 3600
 
 
+def probe_video(run, source):
+    try:
+        return run(
+            ["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-show_entries",
+             "stream=index,codec_type,width,height,duration:stream_disposition=attached_pic:format=duration,format_name",
+             "-of", "json", str(source)], 20,
+        )
+    except subprocess.CalledProcessError:
+        raise HTTPException(422, ERROR)
+
+
 def prepare_video(source, directory, run=None):
     if run is None:
         def run(command, timeout, on_progress=None):
             return subprocess.run(command, capture_output=True, check=True, timeout=timeout).stdout
 
     try:
-        info = json.loads(run(
-            ["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-show_entries",
-             "stream=index,codec_type,width,height,duration:stream_disposition=attached_pic:format=duration,format_name",
-             "-of", "json", str(source)], 20,
-        ))
+        info = json.loads(probe_video(run, source))
         formats = set(info["format"]["format_name"].split(","))
         if not formats.intersection({"mov", "mp4", "matroska", "webm", "avi", "mpegts", "mpeg", "flv", "ogg"}):
             raise ValueError
@@ -58,6 +65,10 @@ def prepare_video(source, directory, run=None):
         if not 0 < (directory / "preview.jpg").stat().st_size <= MAX_PREVIEW:
             raise ValueError
         return round(seconds)
-    except (subprocess.SubprocessError, KeyError, StopIteration, ValueError, OverflowError, FileNotFoundError):
+    except subprocess.TimeoutExpired:
+        raise HTTPException(503, "Истекло время обработки видео.")
+    except subprocess.CalledProcessError:
+        raise HTTPException(503, "FFmpeg завершился с ошибкой.")
+    except (KeyError, StopIteration, ValueError, OverflowError, FileNotFoundError):
         raise HTTPException(422, ERROR)
 

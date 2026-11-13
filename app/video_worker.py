@@ -22,6 +22,7 @@ from app.video_processing import ERROR, prepare_video
 
 LEASE = 30
 ATTEMPTS = 3
+RETRY_DELAY = 10
 MIN_FREE_SPACE = 256 * 1024**2
 SLOT_NAMESPACE = 910207443
 log = logging.getLogger(__name__)
@@ -35,7 +36,7 @@ def claim(db):
     with db.transaction():
         candidates = db.execute("""
             SELECT id, attempts FROM videos
-            WHERE status='queued' OR (status='processing' AND lease_until <= now())
+            WHERE (status='queued' AND retry_at <= now()) OR (status='processing' AND lease_until <= now())
             ORDER BY created_at,id LIMIT 32 FOR UPDATE SKIP LOCKED
         """).fetchall()
         for row in candidates:
@@ -43,7 +44,7 @@ def claim(db):
                 continue
             token = uuid4()
             db.execute("""
-                UPDATE videos SET status='processing', progress=0, attempts=attempts+1,
+                UPDATE videos SET status='processing', progress=0, attempts=attempts+1, error=NULL,
                     lease_token=%s, lease_until=now() + make_interval(secs => %s)
                 WHERE id=%s
             """, (token, LEASE, row["id"]))
@@ -109,7 +110,7 @@ class Pipeline:
         return bytes(output)
 
 
-def finish(db, video_id, token, directory, staging, duration, error=ERROR):
+def finish(db, video_id, token, directory, staging, duration, error=ERROR, retry_delay=0):
     if duration is not None:
         for name in ("video.mp4", "preview.jpg"):
             with (staging / name).open("rb") as result:
@@ -121,7 +122,13 @@ def finish(db, video_id, token, directory, staging, duration, error=ERROR):
         """, (video_id, token)).fetchone()
         if not row:
             raise JobLost
-        if duration is None:
+        if retry_delay:
+            db.execute("""
+                UPDATE videos SET status='queued', progress=0, error=%s,
+                    retry_at=now() + make_interval(secs => %s),
+                    lease_token=NULL, lease_until=NULL WHERE id=%s
+            """, (error, retry_delay, video_id))
+        elif duration is None:
             db.execute("""
                 UPDATE videos SET status='failed', error=%s, lease_token=NULL, lease_until=NULL, cleanup_pending=true
                 WHERE id=%s
@@ -147,6 +154,7 @@ def process(db, video_id, token, attempt):
     try:
         duration = None
         error = ERROR
+        retryable = False
         if attempt <= ATTEMPTS:
             try:
                 staging.mkdir()
@@ -155,9 +163,14 @@ def process(db, video_id, token, attempt):
                 raise
             except HTTPException as exc:
                 error = exc.detail
-            except Exception:
+                retryable = exc.status_code >= 500
+            except psycopg.Error:
+                raise
+            except OSError:
+                retryable = True
                 log.exception("Video processing failed for %s", video_id)
-        finish(db, video_id, token, directory, staging, duration, error)
+        delay = RETRY_DELAY * 2 ** (attempt - 1) if retryable and attempt < ATTEMPTS else 0
+        finish(db, video_id, token, directory, staging, duration, error, delay)
     except JobLost:
         log.info("Video job cancelled or lease lost: %s", video_id)
         return
@@ -177,7 +190,8 @@ def trim_terminal_files(db, video_id):
         """, (video_id,)).fetchone()
         if not row:
             return
-        (directory / "source").unlink(missing_ok=True)
+        if row["status"] == "ready":
+            (directory / "source").unlink(missing_ok=True)
         # Terminal jobs have no current lease. Only remove known staging paths.
         for staging in directory.glob(".processing*"):
             if staging.name != ".processing":
