@@ -189,7 +189,7 @@ def owner_video(db, video_id, user):
 
 @app.get("/api/videos", tags=["Видео"])
 def videos(q: str = Query("", max_length=120), category: str = Query("", max_length=40),
-           feed: Literal["home", "subscriptions", "mine", "shared"] = "home",
+           feed: Literal["home", "subscriptions", "mine", "shared", "liked", "history"] = "home",
            offset: int = Query(0, ge=0), user=Depends(session_user)):
     uid = viewer_id(user)
     if feed != "home" and not user:
@@ -203,7 +203,20 @@ def videos(q: str = Query("", max_length=120), category: str = Query("", max_len
             SELECT 1 FROM grants g WHERE g.video_id=v.id AND g.user_id=%s)""",
     }
     args = [] if feed == "home" else [uid]
-    where = filters[feed]
+    source = SELECT_VIDEO
+    order = "v.created_at DESC"
+    if feed == "liked":
+        source += " JOIN likes l ON l.video_id=v.id AND l.user_id=%s"
+        order = "l.liked_at DESC NULLS LAST, v.created_at DESC"
+    if feed == "history":
+        source += " JOIN video_view_receipts r ON r.video_id=v.id AND r.viewer=%s"
+        args = [f"user:{uid}"]
+        order = "coalesce(r.last_watched_at,r.viewed_at) DESC"
+    if feed in ("liked", "history"):
+        where = VISIBLE
+        args.extend((uid, uid))
+    else:
+        where = filters[feed]
     if q.strip():
         where += " AND strpos(lower(v.title), lower(%s)) > 0"
         args.append(q.strip())
@@ -211,7 +224,7 @@ def videos(q: str = Query("", max_length=120), category: str = Query("", max_len
         where += " AND v.category=%s"
         args.append(category)
     with pool.connection() as db:
-        return db.execute(f"{SELECT_VIDEO} WHERE {where} ORDER BY v.created_at DESC,v.id LIMIT 24 OFFSET %s",
+        return db.execute(f"{source} WHERE {where} ORDER BY {order},v.id LIMIT 24 OFFSET %s",
                           (*args, offset)).fetchall()
 
 def prepare_video(source, directory):
@@ -328,6 +341,11 @@ def count_view(video_id: UUID, request: Request, user=Depends(session_user)):
             WHERE video_view_receipts.viewed_at <= excluded.viewed_at - interval '24 hours'
             RETURNING video_id
         """, (video_id, viewer)).fetchone()
+        if user:
+            db.execute("""
+                UPDATE video_view_receipts SET last_watched_at=clock_timestamp()
+                WHERE video_id=%s AND viewer=%s
+            """, (video_id, viewer))
         if counted:
             return db.execute("UPDATE videos SET views=views+1 WHERE id=%s RETURNING views",
                               (video_id,)).fetchone()
@@ -388,7 +406,7 @@ def revoke_access(video_id: UUID, handle: Handle, user=Depends(signed_in)):
 def like(video_id: UUID, user=Depends(signed_in)):
     with pool.connection() as db:
         video_for(db, video_id, user)
-        db.execute("INSERT INTO likes VALUES (%s,%s) ON CONFLICT DO NOTHING", (video_id, user["id"]))
+        db.execute("INSERT INTO likes (video_id,user_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", (video_id, user["id"]))
 
 @app.delete("/api/videos/{video_id}/like", tags=["Видео"], status_code=204)
 def unlike(video_id: UUID, user=Depends(signed_in)):
@@ -564,6 +582,8 @@ def change_role(handle: Handle, payload: RoleInput, user=Depends(admin)):
 @app.get("/subscriptions", include_in_schema=False)
 @app.get("/mine", include_in_schema=False)
 @app.get("/shared", include_in_schema=False)
+@app.get("/liked", include_in_schema=False)
+@app.get("/history", include_in_schema=False)
 @app.get("/moderation", include_in_schema=False)
 def frontend():
     return FileResponse(ROOT / "static" / "index.html", media_type="text/html")

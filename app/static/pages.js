@@ -222,7 +222,7 @@ async function render() {
   main.innerHTML = '<div class="loading" role="status">Загрузка…</div>';
   try {
     let result;
-    if (["/","/search","/subscriptions","/mine","/shared"].includes(path)) result = await feed(path,query,current);
+    if (["/","/search","/subscriptions","/mine","/shared","/liked","/history"].includes(path)) result = await feed(path,query,current);
     else if (path === "/upload") result = upload();
     else if (path === "/login" || path === "/register") result = auth(path,query);
     else if (section === "watch" && /^[a-f0-9-]{36}$/.test(id)) result = await watch(id,current);

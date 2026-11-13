@@ -75,3 +75,11 @@ CREATE TABLE IF NOT EXISTS video_view_receipts (
     viewed_at timestamptz NOT NULL,
     PRIMARY KEY (video_id, viewer)
 );
+
+ALTER TABLE likes ADD COLUMN IF NOT EXISTS liked_at timestamptz;
+ALTER TABLE likes ALTER COLUMN liked_at SET DEFAULT now();
+CREATE INDEX IF NOT EXISTS likes_by_user ON likes (user_id, liked_at DESC NULLS LAST);
+
+ALTER TABLE video_view_receipts ADD COLUMN IF NOT EXISTS last_watched_at timestamptz;
+CREATE INDEX IF NOT EXISTS video_view_receipts_by_viewer
+    ON video_view_receipts (viewer, (coalesce(last_watched_at, viewed_at)) DESC);

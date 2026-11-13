@@ -71,7 +71,7 @@ def seed_demo_data(db):
 
     viewer, lab, studio = (users[name] for name in ("demo_viewer", "demo_lab", "demo_studio"))
     db.execute("INSERT INTO grants VALUES (%s,%s)", (video_ids[3], viewer))
-    db.execute("INSERT INTO likes VALUES (%s,%s),(%s,%s),(%s,%s)",
+    db.execute("INSERT INTO likes (video_id,user_id) VALUES (%s,%s),(%s,%s),(%s,%s)",
                (video_ids[0], viewer, video_ids[0], studio, video_ids[1], viewer))
     db.execute("INSERT INTO subscriptions VALUES (%s,%s),(%s,%s)", (lab, viewer, studio, viewer))
     db.execute("""

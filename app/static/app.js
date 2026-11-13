@@ -10,6 +10,7 @@ const icons = {
   shield: "M12 22s7-3 7-9V5l-7-3-7 3v8c0 6 7 9 7 9Z", upload: "M12 16V3m-5 5 5-5 5 5M4 16v5h16v-5",
   flag: "M5 22V3c5-4 9 4 15 0v11c-6 4-10-4-15 0", like: "M7 10v11H3V10zm0 10h11a2 2 0 0 0 2-2l1-6a2 2 0 0 0-2-2h-5l1-5a2 2 0 0 0-2-2l-6 7",
   film: "M3 4h18v16H3zM7 4v16M17 4v16M3 9h4m-4 6h4m10-6h4m-4 6h4",
+  history: "M3 12a9 9 0 1 1 2.7 6.4M3 5v7h7m2-5v5l3 2",
   arrow: "m9 5 7 7-7 7", code: "m8 6-6 6 6 6m8-12 6 6-6 6", logout: "M10 3H4v18h6m4-14 5 5-5 5m5-5H8",
 };
 const icon = (name) => `<svg aria-hidden="true" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.65" stroke-linecap="round" stroke-linejoin="round"><path d="${icons[name]}"/></svg>`;
@@ -97,6 +98,7 @@ function shell() {
   $("#sidebar").innerHTML = `
     <nav>${link("/", "Главная", "home")}${link("/subscriptions", "Подписки", "subs")}</nav>
     <nav><p>Вы</p>${link("/mine", "Мои видео", "library")}${link("/shared", "Доступные мне", "lock")}
+    ${link("/liked", "Понравившиеся", "like")}${link("/history", "История просмотра", "history")}
     ${user ? link(channelURL(user.handle), "Мой канал", "user") : ""}</nav>
     <nav>${user && user.role !== "user" ? link("/moderation", "Модерация", "shield") : ""}
     <a href="/docs">${icon("code")}<span>Swagger API</span></a>
@@ -158,10 +160,10 @@ function pagination(count, fetchNext, append, limit = 24) {
 }
 
 async function feed(path, query, current) {
-  const mode = ({"/subscriptions":"subscriptions","/mine":"mine","/shared":"shared"})[path] ?? "home";
+  const mode = ({"/subscriptions":"subscriptions","/mine":"mine","/shared":"shared","/liked":"liked","/history":"history"})[path] ?? "home";
   if (mode !== "home" && !user) return signedOut("Этот раздел доступен после входа");
   const search = path === "/search";
-  const title = search ? "Результаты поиска" : ({home:"Главная",subscriptions:"Подписки",mine:"Мои видео",shared:"Доступные мне"})[mode];
+  const title = search ? "Результаты поиска" : ({home:"Главная",subscriptions:"Подписки",mine:"Мои видео",shared:"Доступные мне",liked:"Понравившиеся",history:"История просмотра"})[mode];
   const q = search ? query.get("q") ?? "" : "";
   const selected = query.get("category") ?? "";
   const params = new URLSearchParams({feed:mode,q,category:selected});
@@ -173,7 +175,7 @@ async function feed(path, query, current) {
   main.innerHTML = `<div class="page-heading"><div><h1>${title}</h1>${search ? `<p>По запросу «${esc(q)}»</p>` : ""}</div>
     ${mode === "mine" ? '<a data-nav class="button primary" href="/upload">Загрузить видео</a>' : ""}</div>
     ${pills}${videos.length ? grid(videos, mode === "mine") + more(videos.length) :
-      empty(search ? "Видео не найдены" : "Здесь пока нет видео", search ? "Попробуйте другой запрос." : "", search ? "search" : "film")}`;
+      empty(search ? "Видео не найдены" : ({liked:"У вас пока нет понравившихся видео",history:"История просмотра пуста"})[mode] ?? "Здесь пока нет видео", search ? "Попробуйте другой запрос." : "", search ? "search" : "film")}`;
   pagination(videos.length, fetchNext, rows => $(".grid").insertAdjacentHTML("beforeend", rows.map(v => card(v, mode === "mine")).join("")));
 }
 
