@@ -83,3 +83,8 @@ CREATE INDEX IF NOT EXISTS likes_by_user ON likes (user_id, liked_at DESC NULLS 
 ALTER TABLE video_view_receipts ADD COLUMN IF NOT EXISTS last_watched_at timestamptz;
 CREATE INDEX IF NOT EXISTS video_view_receipts_by_viewer
     ON video_view_receipts (viewer, (coalesce(last_watched_at, viewed_at)) DESC);
+
+CREATE TABLE IF NOT EXISTS upload_attempts (
+    user_id bigint PRIMARY KEY REFERENCES accounts ON DELETE CASCADE,
+    started_at timestamptz NOT NULL
+);

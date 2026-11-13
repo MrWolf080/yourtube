@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse
 from fastapi.security import APIKeyCookie
 from fastapi.staticfiles import StaticFiles
+from starlette.requests import ClientDisconnect
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, StringConstraints
@@ -23,6 +25,10 @@ from starlette.concurrency import run_in_threadpool
 ROOT = Path(__file__).resolve().parent
 MEDIA = Path(os.environ.get("MEDIA_DIR", "media")).resolve()
 LIMIT = int(os.environ.get("UPLOAD_MAX_BYTES", 512 * 1024**2))
+UPLOAD_SLOTS = 2
+UPLOAD_COOLDOWN = 60
+UPLOAD_RECEIVE_TIMEOUT = 300
+UPLOAD_LOCK_NAMESPACE = 910207441
 CATEGORIES = ("Кино", "Природа", "Путешествия", "Музыка", "Технологии", "Другое")
 COOKIE = "yourtube_session"
 VIEWER_COOKIE = "yourtube_viewer"
@@ -274,28 +280,77 @@ def publish_video(directory, video_id, metadata, duration, user):
         final.rename(directory)
         raise
 
+def upload_slot(request: Request, user=Depends(signed_in)):
+    length = request.headers.get("content-length", "")
+    if length.isdecimal() and int(length) > LIMIT:
+        fail(413, "Файл слишком большой")
+
+    # Reserve a shared slot before reading the body. The PostgreSQL session
+    # releases its locks if the application process or connection dies.
+    with pool.connection() as db:
+        try:
+            for slot in range(UPLOAD_SLOTS):
+                acquired = db.execute(
+                    "SELECT pg_try_advisory_lock(%s,%s) AS acquired",
+                    (UPLOAD_LOCK_NAMESPACE, slot),
+                ).fetchone()["acquired"]
+                if acquired:
+                    break
+            else:
+                raise HTTPException(503, "Все места для загрузки заняты", headers={"Retry-After": "5"})
+
+            account_lock = db.execute(
+                "SELECT pg_try_advisory_lock(%s) AS acquired", (-user["id"],),
+            ).fetchone()
+            if not account_lock["acquired"]:
+                raise HTTPException(429, "У вас уже есть активная загрузка", headers={"Retry-After": "5"})
+
+            with db.transaction():
+                attempt = db.execute("""
+                    INSERT INTO upload_attempts (user_id, started_at) VALUES (%s,clock_timestamp())
+                    ON CONFLICT (user_id) DO UPDATE SET started_at=clock_timestamp()
+                    WHERE upload_attempts.started_at <= clock_timestamp() - make_interval(secs => %s)
+                    RETURNING user_id
+                """, (user["id"], UPLOAD_COOLDOWN)).fetchone()
+            db.commit()
+            if not attempt:
+                raise HTTPException(429, "Подождите перед следующей загрузкой",
+                                    headers={"Retry-After": str(UPLOAD_COOLDOWN)})
+            yield user
+        finally:
+            try:
+                db.rollback()
+                db.execute("SELECT pg_advisory_unlock_all()")
+            except Exception:
+                db.close()
+                raise
+
+
 @app.post("/api/videos", tags=["Видео"], status_code=201, openapi_extra={"requestBody": {
     "required": True, "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}},
 }})
 async def upload(request: Request, title: Title, description: str = Query("", max_length=5000),
                  category: Literal["Кино", "Природа", "Путешествия", "Музыка", "Технологии", "Другое"] = "Другое",
-                 private: bool = False, user=Depends(signed_in)):
+                 private: bool = False, user=Depends(upload_slot, scope="function")):
     metadata = VideoInput(title=title, description=description, category=category, private=private)
-    length = request.headers.get("content-length", "")
-    if length.isdecimal() and int(length) > LIMIT:
-        fail(413, "Файл слишком большой")
     video_id = uuid4()
     with tempfile.TemporaryDirectory(prefix=".upload-", dir=MEDIA) as tmp:
         directory = Path(tmp)
         source = directory / "source"
         size = 0
-        with source.open("wb") as target:
-            async for chunk in request.stream():
-                size += len(chunk)
-                if size > LIMIT:
-                    fail(413, "Файл слишком большой")
-                if chunk:
-                    await run_in_threadpool(target.write, chunk)
+        try:
+            async with asyncio.timeout(UPLOAD_RECEIVE_TIMEOUT):
+                with source.open("wb") as target:
+                    async for chunk in request.stream():
+                        size += len(chunk)
+                        if size > LIMIT:
+                            fail(413, "Файл слишком большой")
+                        if chunk:
+                            await run_in_threadpool(target.write, chunk)
+        except TimeoutError:
+            fail(408, "Время загрузки истекло")
+        except ClientDisconnect:
+            fail(400, "Загрузка прервана")
         if not size:
             fail(422, "Выберите видеофайл")
         duration = await run_in_threadpool(prepare_video, source, directory)
