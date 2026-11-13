@@ -10,6 +10,8 @@ import threading
 import time
 from uuid import UUID, uuid4
 
+from fastapi import HTTPException
+
 import psycopg
 from psycopg.rows import dict_row
 
@@ -18,6 +20,7 @@ from app.video_processing import ERROR, prepare_video
 
 LEASE = 30
 ATTEMPTS = 3
+MIN_FREE_SPACE = 256 * 1024**2
 SLOT_NAMESPACE = 910207443
 log = logging.getLogger(__name__)
 
@@ -77,6 +80,8 @@ class Pipeline:
                             raise subprocess.TimeoutExpired(command, timeout)
                         if now >= renew_at:
                             heartbeat(self.db, self.id, self.token, self.progress)
+                            if shutil.disk_usage(MEDIA).free < MIN_FREE_SPACE:
+                                raise HTTPException(507, "Недостаточно места для обработки видео.")
                             renew_at = now + 2
                         if not selector.select(timeout=0.5):
                             continue
@@ -102,7 +107,7 @@ class Pipeline:
         return bytes(output)
 
 
-def finish(db, video_id, token, directory, staging, duration):
+def finish(db, video_id, token, directory, staging, duration, error=ERROR):
     if duration is not None:
         for name in ("video.mp4", "preview.jpg"):
             with (staging / name).open("rb") as result:
@@ -118,7 +123,7 @@ def finish(db, video_id, token, directory, staging, duration):
             db.execute("""
                 UPDATE videos SET status='failed', error=%s, lease_token=NULL, lease_until=NULL, cleanup_pending=true
                 WHERE id=%s
-            """, (ERROR, video_id))
+            """, (error, video_id))
         else:
             for name in ("video.mp4", "preview.jpg"):
                 (staging / name).replace(directory / name)
@@ -139,15 +144,18 @@ def process(db, video_id, token, attempt):
     source = directory / "source"
     try:
         duration = None
+        error = ERROR
         if attempt <= ATTEMPTS:
             try:
                 staging.mkdir()
                 duration = prepare_video(source, staging, Pipeline(db, video_id, token).run)
             except JobLost:
                 raise
+            except HTTPException as exc:
+                error = exc.detail
             except Exception:
                 log.exception("Video processing failed for %s", video_id)
-        finish(db, video_id, token, directory, staging, duration)
+        finish(db, video_id, token, directory, staging, duration, error)
     except JobLost:
         log.info("Video job cancelled or lease lost: %s", video_id)
         return

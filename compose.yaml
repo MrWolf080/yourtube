@@ -46,6 +46,9 @@ services:
     command: ["python", "-m", "app.video_worker"]
     restart: unless-stopped
     stop_grace_period: 17m
+    cpus: "${WORKER_CPUS:-2.0}"
+    mem_limit: ${WORKER_MEMORY:-2g}
+    memswap_limit: ${WORKER_MEMORY:-2g}
     depends_on:
       app:
         condition: service_healthy
