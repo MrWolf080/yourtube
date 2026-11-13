@@ -1,0 +1,43 @@
+name: yourtube
+
+services:
+  db:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: yourtube
+      POSTGRES_USER: yourtube
+      POSTGRES_PASSWORD: ${YOURTUBE_DB_PASSWORD:?Run bash deploy.sh to generate .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-U", "yourtube", "-d", "yourtube"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: "postgresql://yourtube:${YOURTUBE_DB_PASSWORD}@db/yourtube"
+      UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-536870912}
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+    volumes:
+      - video_data:/data/media
+    ports:
+      - "${YOURTUBE_BIND:-0.0.0.0}:${YOURTUBE_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/videos', timeout=3).close()"]
+      interval: 5s
+      timeout: 4s
+      retries: 15
+
+volumes:
+  postgres_data:
+  video_data:
+
