@@ -38,6 +38,8 @@ STORAGE_SWEEP_INTERVAL = 60 * 60
 STORAGE_SWEEP_BATCH = 500
 UPLOAD_LOCK_NAMESPACE = 910207441
 CATEGORIES = ("Кино", "Природа", "Путешествия", "Музыка", "Технологии", "Другое")
+PUBLIC_ORIGIN = os.environ.get("PUBLIC_ORIGIN", "").rstrip("/")
+COOKIE_SECURE = PUBLIC_ORIGIN.startswith("https://") or os.environ.get("COOKIE_SECURE") == "1"
 COOKIE = "yourtube_session"
 VIEWER_COOKIE = "yourtube_viewer"
 cookie = APIKeyCookie(name=COOKIE, auto_error=False)
@@ -142,7 +144,7 @@ def admin(user=Depends(signed_in)):
 async def same_origin(request: Request, call_next):
     if request.method not in ("GET", "HEAD", "OPTIONS"):
         origin = request.headers.get("origin")
-        expected = os.environ.get("PUBLIC_ORIGIN") or f"{request.url.scheme}://{request.headers.get('host')}"
+        expected = PUBLIC_ORIGIN or f"{request.url.scheme}://{request.headers.get('host')}"
         if origin and origin != expected:
             return Response(status_code=403)
         if request.headers.get("sec-fetch-site") == "cross-site":
@@ -158,7 +160,7 @@ def login_session(db, response, user):
     db.execute("DELETE FROM sessions WHERE expires <= now()")
     db.execute("INSERT INTO sessions VALUES (%s,%s,now() + interval '14 days')", (digest(token), user["id"]))
     response.set_cookie(COOKIE, token, httponly=True, samesite="lax",
-                        secure=os.environ.get("COOKIE_SECURE") == "1", max_age=14 * 86400)
+                        secure=COOKIE_SECURE, max_age=14 * 86400)
 
 @app.post("/api/register", tags=["Аккаунт"], status_code=201)
 def register(payload: Credentials, request: Request, response: Response):
@@ -204,7 +206,7 @@ def logout(response: Response, token: Annotated[str | None, Depends(cookie)]):
     if token:
         with pool.connection() as db:
             db.execute("DELETE FROM sessions WHERE digest=%s", (digest(token),))
-    response.delete_cookie(COOKIE)
+    response.delete_cookie(COOKIE, secure=COOKIE_SECURE, httponly=True, samesite="lax")
 
 @app.get("/api/me", tags=["Аккаунт"])
 def me(user=Depends(session_user)):
@@ -481,7 +483,7 @@ def get_video(video_id: UUID, request: Request, response: Response, user=Depends
         """, (video_id, video_id, uid, video["owner_id"], video["owner_id"], uid)).fetchone())
         if not request.cookies.get(VIEWER_COOKIE):
             response.set_cookie(VIEWER_COOKIE, secrets.token_urlsafe(32), httponly=True,
-                                samesite="lax", secure=os.environ.get("COOKIE_SECURE") == "1",
+                                samesite="lax", secure=COOKIE_SECURE,
                                 max_age=365 * 86400)
         return video
 
