@@ -127,8 +127,8 @@ function card(v, manage = false, playlist = null) {
   const href = manage ? "/manage/" + v.id : "/watch/" + v.id;
   return `<article class="card">
     <a data-nav class="thumbnail" href="${href}" aria-label="${esc(v.title)}">
-      ${v.hidden ? icon("shield") : `<img src="${videoAPI(v.id)}/preview" alt="" loading="lazy">`}
-      ${v.hidden || v.private ? `<span class="visibility">${v.hidden ? "Скрыто" : "Приватное"}</span>` : ""}
+      ${v.hidden ? icon("shield") : v.status !== "ready" ? icon("library") : `<img src="${videoAPI(v.id)}/preview" alt="" loading="lazy">`}
+      ${v.hidden || v.private || v.status !== "ready" ? `<span class="visibility">${v.hidden ? "Скрыто" : ({queued:"В очереди",processing:"Обрабатывается",failed:"Ошибка обработки"})[v.status] || "Приватное"}</span>` : ""}
       <time>${duration(v.duration)}</time>
     </a>
     <div class="card-info"><a data-nav href="${channelURL(v.handle)}" aria-label="Канал ${esc(v.handle)}">${avatar(v.handle)}</a>
@@ -235,13 +235,13 @@ function upload() {
       meter.value = pct;
       status.textContent = "Загрузка… " + pct + "%";
     };
-    xhr.upload.onload = () => { meter.removeAttribute("value"); status.textContent = "Видео обрабатывается…"; };
+    xhr.upload.onload = () => { meter.removeAttribute("value"); status.textContent = "Сохранение файла…"; };
     const finish = () => { pendingUpload = false; button.disabled = false; };
     const error = (message) => { finish(); progress.hidden = true; errorBox.hidden = false; errorBox.textContent = message; };
     xhr.onerror = () => error("Соединение прервалось. Попробуйте снова.");
     xhr.onabort = finish;
     xhr.onload = () => {
-      if (xhr.status === 201) { finish(); toast("Видео опубликовано"); go("/manage/" + xhr.response.id); }
+      if (xhr.status === 202) { finish(); toast("Файл загружен"); go("/manage/" + xhr.response.id); }
       else if (xhr.status === 401) { finish(); go(loginURL()); }
       else error(typeof xhr.response?.detail === "string" ? xhr.response.detail : "Проверьте файл и метаданные.");
     };

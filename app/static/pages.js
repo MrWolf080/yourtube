@@ -152,14 +152,39 @@ async function manage(id, current) {
   if (!current()) return;
   main.innerHTML = `<div class="page-heading"><div><h1>Управление видео</h1><p>${esc(v.title)}${v.hidden ? " · Скрыто модератором" : ""}</p></div>
     <div class="inline">
-      ${!v.hidden ? `<a data-nav class="button" href="/watch/${id}">Смотреть</a>` : ""}
+      ${!v.hidden && v.status === "ready" ? `<a data-nav class="button" href="/watch/${id}">Смотреть</a>` : ""}
       <button type="button" id="delete-video" class="button danger">Удалить видео</button>
     </div></div>
+    <div id="processing-status" class="panel access" role="status">${v.status === "ready" ? "Видео опубликовано" : "Получение статуса…"}</div>
     <form id="edit" class="panel stack form-wide">${metaFields(v)}<button class="button primary">Сохранить</button></form>
     <section class="panel form-wide access"><h2>Доступ к приватному видео</h2>
       <form id="grant" class="inline"><label>Имя пользователя<input name="handle" pattern="[A-Za-z0-9_]{3,30}" required></label><button class="button">Разрешить</button></form>
       <div id="grants">${access.map(a => `<div class="access-row"><span>@${esc(a.handle)}</span><button class="button revoke" data-handle="${esc(a.handle)}">Отозвать</button></div>`).join("")}</div>
     </section>`;
+  async function pollStatus() {
+    try {
+      const status = await api(url + "/status");
+      if (!current()) return;
+      const panel = $("#processing-status");
+      panel.hidden = false;
+      panel.textContent = ({
+        queued: "Видео ожидает обработки",
+        processing: "Обработка видео — " + status.progress + "%",
+        ready: "Видео опубликовано",
+        failed: status.error || "Не удалось обработать видео"
+      })[status.status];
+      if (status.status === "ready") {
+        toast("Видео опубликовано");
+        render();
+        return;
+      }
+      if (status.status === "failed") return;
+    } catch (error) {
+      if (!current() || error.status === 404 || error.status === 401) return;
+    }
+    setTimeout(() => { if (current()) pollStatus(); }, 1500);
+  }
+  if (v.status !== "ready") pollStatus();
   bind("#delete-video", "click", async e => {
     if (!confirm("Удалить видео и связанные комментарии? Это действие нельзя отменить.")) return;
     const button = e.currentTarget;

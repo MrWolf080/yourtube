@@ -102,3 +102,17 @@ CREATE TABLE IF NOT EXISTS pending_video_deletions (
     video_id uuid PRIMARY KEY,
     last_attempt_at timestamptz NOT NULL DEFAULT now()
 );
+
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'ready'
+    CHECK (status IN ('queued','processing','ready','failed'));
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS progress integer NOT NULL DEFAULT 100
+    CHECK (progress BETWEEN 0 AND 100);
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS error text;
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS lease_token uuid;
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS lease_until timestamptz;
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS reserved_bytes bigint;
+ALTER TABLE pending_video_deletions ADD COLUMN IF NOT EXISTS reserved_bytes bigint;
+CREATE INDEX IF NOT EXISTS videos_queue ON videos (created_at,id)
+    WHERE status IN ('queued','processing');
+ALTER TABLE videos ADD COLUMN IF NOT EXISTS cleanup_pending boolean NOT NULL DEFAULT false;

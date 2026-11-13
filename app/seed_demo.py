@@ -11,7 +11,8 @@ from uuid import UUID
 
 import psycopg
 
-from app.main import MEDIA, passwords, prepare_video
+from app.main import MEDIA, passwords
+from app.video_processing import prepare_video
 
 VERSION = "001_demo_data"
 ADMIN_VERSION = "002_demo_admin"
@@ -77,6 +78,8 @@ def seed_demo_data(db):
         """, (video_id, users[owner], title, "Тестовый ролик, сгенерированный FFmpeg.",
               category, private, seconds, index))
         install_media(video_id, pattern, seconds)
+        size = sum(item.stat().st_size for item in (MEDIA / str(video_id)).iterdir() if item.is_file())
+        db.execute("UPDATE videos SET reserved_bytes=%s WHERE id=%s", (size, video_id))
         video_ids.append(video_id)
 
     viewer, lab, studio = (users[name] for name in ("demo_viewer", "demo_lab", "demo_studio"))

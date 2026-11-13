@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode
@@ -60,8 +61,15 @@ def main():
                         "testsrc2=size=320x180:rate=12", "-t", "2", "-c:v", "libx264", str(video)], check=True)
         title = "Видео " + SUFFIX
         query = urlencode({"title": title, "category": "Кино", "private": "true"})
-        video_id = owner.request("/api/videos?" + query, 201, "POST", video.read_bytes())["id"]
+        video_id = owner.request("/api/videos?" + query, 202, "POST", video.read_bytes())["id"]
     path = "/api/videos/" + video_id
+    deadline = time.monotonic() + 40
+    while True:
+        status = owner.request(path + "/status")
+        if status["status"] == "ready":
+            break
+        assert status["status"] != "failed" and time.monotonic() < deadline, status
+        time.sleep(0.2)
     for extension in ("", "/stream", "/preview", "/comments"):
         guest.request(path + extension, 404)
         moderator.request(path + extension, 404)

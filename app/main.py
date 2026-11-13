@@ -1,12 +1,11 @@
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import secrets
 import shutil
-import subprocess
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated, Literal
@@ -25,10 +24,12 @@ from pydantic import BaseModel, StringConstraints, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from app.auth_limits import audit, client_ip, enforce, password_slot
+from app.video_processing import MAX_OUTPUT, MAX_PREVIEW
 
 ROOT = Path(__file__).resolve().parent
 MEDIA = Path(os.environ.get("MEDIA_DIR", "media")).resolve()
 LIMIT = int(os.environ.get("UPLOAD_MAX_BYTES", 512 * 1024**2))
+MEDIA_QUOTA = int(os.environ.get("MEDIA_QUOTA_BYTES", 20 * 1024**3))
 UPLOAD_SLOTS = 2
 UPLOAD_COOLDOWN = 60
 UPLOAD_RECEIVE_TIMEOUT = 300
@@ -38,8 +39,9 @@ COOKIE = "yourtube_session"
 VIEWER_COOKIE = "yourtube_viewer"
 cookie = APIKeyCookie(name=COOKIE, auto_error=False)
 passwords = PasswordHasher()
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql:///yourtube")
 pool = ConnectionPool(
-    os.environ.get("DATABASE_URL", "postgresql:///yourtube"),
+    DATABASE_URL,
     kwargs={"row_factory": dict_row}, min_size=1, max_size=8, open=False,
 )
 
@@ -49,6 +51,11 @@ async def lifespan(app):
     pool.open(wait=True)
     with pool.connection() as db:
         db.execute((ROOT / "schema.sql").read_text(encoding="utf-8"))
+        for table, key in (("videos", "id"), ("pending_video_deletions", "video_id")):
+            for row in db.execute(f"SELECT {key} FROM {table} WHERE reserved_bytes IS NULL"):
+                size = sum(item.stat().st_size for item in (MEDIA / str(row[key])).glob("*") if item.is_file())
+                db.execute(f"UPDATE {table} SET reserved_bytes=%s WHERE {key}=%s AND reserved_bytes IS NULL",
+                           (size, row[key]))
     cleanup = asyncio.create_task(retry_media_cleanup())
     try:
         yield
@@ -197,7 +204,7 @@ def me(user=Depends(session_user)):
     return user
 
 SELECT_VIDEO = "SELECT v.*, a.handle FROM videos v JOIN accounts a ON a.id = v.owner_id"
-VISIBLE = """NOT v.hidden AND (NOT v.private OR v.owner_id = %s OR EXISTS (
+VISIBLE = """v.status='ready' AND NOT v.hidden AND (NOT v.private OR v.owner_id = %s OR EXISTS (
     SELECT 1 FROM grants g WHERE g.video_id=v.id AND g.user_id=%s
 ))"""
 
@@ -248,6 +255,8 @@ def videos(q: str = Query("", max_length=120), category: str = Query("", max_len
         args.extend((uid, uid))
     else:
         where = filters[feed]
+    if feed in ("home", "subscriptions", "shared"):
+        where += " AND v.status='ready'"
     if q.strip():
         where += " AND strpos(lower(v.title), lower(%s)) > 0"
         args.append(q.strip())
@@ -258,52 +267,65 @@ def videos(q: str = Query("", max_length=120), category: str = Query("", max_len
         return db.execute(f"{source} WHERE {where} ORDER BY {order},v.id LIMIT 24 OFFSET %s",
                           (*args, offset)).fetchall()
 
-def prepare_video(source, directory):
-    try:
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-protocol_whitelist", "file", "-show_entries",
-             "stream=codec_type,codec_name:stream_disposition=attached_pic:format=duration,format_name",
-             "-of", "json", str(source)], capture_output=True, check=True, timeout=20,
-        )
-        info = json.loads(probe.stdout)
-        formats = set(info["format"]["format_name"].split(","))
-        if not formats.intersection({"mov", "mp4", "matroska", "webm", "avi", "mpegts", "mpeg", "flv", "ogg"}):
-            raise ValueError
-        streams = info.get("streams", [])
-        index = next(i for i, stream in enumerate(streams) if stream["codec_type"] == "video"
-                     and not stream.get("disposition", {}).get("attached_pic"))
-        duration = round(float(info["format"]["duration"]))
-        if duration < 0:
-            raise ValueError
-        ffmpeg = ["ffmpeg", "-nostdin", "-v", "error", "-protocol_whitelist", "file", "-threads", "2", "-i", str(source)]
-        subprocess.run(ffmpeg + [
-            "-map", f"0:{index}", "-map", "0:a:0?", "-map_metadata", "-1", "-map_chapters", "-1",
-            "-vf", "scale=w='min(1920,iw)':h=-2", "-pix_fmt", "yuv420p", "-c:v", "libx264",
-            "-preset", "veryfast", "-threads", "2", "-c:a", "aac", "-movflags", "+faststart",
-            str(directory / "video.mp4"),
-        ], capture_output=True, check=True, timeout=900)
-        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-ss", str(min(2, duration / 4)),
-                        "-i", str(directory / "video.mp4"), "-frames:v", "1", "-vf", "scale=640:-2",
-                        str(directory / "preview.jpg")], capture_output=True, check=True, timeout=30)
-        if not (directory / "preview.jpg").is_file():
-            raise ValueError
-        return duration
-    except (subprocess.SubprocessError, KeyError, StopIteration, ValueError, OverflowError):
-        fail(422, "Не удалось обработать видео. Попробуйте другой файл.")
+def video_lock(db, video_id, *, transaction=True):
+    query = ("SELECT pg_try_advisory_xact_lock(hashtextextended(%s, 710)) AS locked"
+             if transaction else "SELECT pg_try_advisory_lock(hashtextextended(%s, 710)) AS locked")
+    return db.execute(query, (str(video_id),)).fetchone()["locked"]
 
-def publish_video(directory, video_id, metadata, duration, user):
+
+def enqueue_video(directory, video_id, metadata, size, user):
     final = MEDIA / str(video_id)
-    directory.rename(final)
-    try:
-        with pool.connection() as db:
-            db.execute("""
-                INSERT INTO videos (id,owner_id,title,description,category,private,duration)
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
-            """, (video_id, user["id"], metadata.title, metadata.description,
-                  metadata.category, metadata.private, duration))
-    except Exception:
-        final.rename(directory)
-        raise
+    with pool.connection() as db:
+        if not video_lock(db, video_id):
+            fail(503, "Не удалось сохранить видео. Повторите загрузку.")
+        db.execute("SELECT pg_advisory_xact_lock(910207444)")
+        usage = db.execute("""
+            SELECT coalesce(sum(reserved_bytes),0) +
+                (SELECT coalesce(sum(reserved_bytes),0) FROM pending_video_deletions) AS total
+            FROM videos
+        """).fetchone()["total"]
+        reserved = size + MAX_OUTPUT + MAX_PREVIEW
+        if usage + reserved + UPLOAD_SLOTS * LIMIT > MEDIA_QUOTA:
+            fail(507, "Хранилище видео заполнено")
+        db.execute("""
+            INSERT INTO videos (id,owner_id,title,description,category,private,duration,status,progress,reserved_bytes)
+            VALUES (%s,%s,%s,%s,%s,%s,0,'queued',0,%s)
+        """, (video_id, user["id"], metadata.title, metadata.description,
+              metadata.category, metadata.private, reserved))
+        directory.rename(final)
+        for path in (final, MEDIA):
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+
+
+def sweep_uploads():
+    cutoff = time.time() - 3600
+    with pool.connection() as db:
+        for path in MEDIA.iterdir():
+            try:
+                if not path.is_dir() or path.stat().st_mtime >= cutoff:
+                    continue
+                if path.name.startswith(".upload-"):
+                    shutil.rmtree(path)
+                    continue
+                try:
+                    video_id = UUID(path.name)
+                except ValueError:
+                    continue
+                if str(video_id) != path.name or path.is_symlink() or not video_lock(db, video_id):
+                    continue
+                exists = db.execute("""
+                    SELECT id FROM videos WHERE id=%s
+                    UNION ALL SELECT video_id FROM pending_video_deletions WHERE video_id=%s
+                """, (video_id, video_id)).fetchone()
+                if not exists:
+                    shutil.rmtree(path)
+            except FileNotFoundError:
+                continue
+
 
 def upload_slot(request: Request, user=Depends(signed_in)):
     length = request.headers.get("content-length", "")
@@ -341,6 +363,8 @@ def upload_slot(request: Request, user=Depends(signed_in)):
             if not attempt:
                 raise HTTPException(429, "Подождите перед следующей загрузкой",
                                     headers={"Retry-After": str(UPLOAD_COOLDOWN)})
+            if shutil.disk_usage(MEDIA).free < UPLOAD_SLOTS * LIMIT + 2 * MAX_OUTPUT:
+                fail(507, "Недостаточно свободного места для загрузки")
             yield user
         finally:
             try:
@@ -351,7 +375,7 @@ def upload_slot(request: Request, user=Depends(signed_in)):
                 raise
 
 
-@app.post("/api/videos", tags=["Видео"], status_code=201, openapi_extra={"requestBody": {
+@app.post("/api/videos", tags=["Видео"], status_code=202, openapi_extra={"requestBody": {
     "required": True, "content": {"application/octet-stream": {"schema": {"type": "string", "format": "binary"}}},
 }})
 async def upload(request: Request, title: Title, description: str = Query("", max_length=5000),
@@ -372,16 +396,28 @@ async def upload(request: Request, title: Title, description: str = Query("", ma
                             fail(413, "Файл слишком большой")
                         if chunk:
                             await run_in_threadpool(target.write, chunk)
+                    await run_in_threadpool(target.flush)
+                    await run_in_threadpool(os.fsync, target.fileno())
         except TimeoutError:
             fail(408, "Время загрузки истекло")
         except ClientDisconnect:
             fail(400, "Загрузка прервана")
         if not size:
             fail(422, "Выберите видеофайл")
-        duration = await run_in_threadpool(prepare_video, source, directory)
-        source.unlink()
-        await run_in_threadpool(publish_video, directory, video_id, metadata, duration, user)
-    return {"id": video_id}
+        await run_in_threadpool(enqueue_video, directory, video_id, metadata, size, user)
+    return {"id": video_id, "video_id": video_id, "status": "queued"}
+
+
+@app.get("/api/videos/{video_id}/status", tags=["Видео"])
+def video_status(video_id: UUID, user=Depends(signed_in)):
+    with pool.connection() as db:
+        row = db.execute("""
+            SELECT id AS video_id,status,progress,error FROM videos WHERE id=%s AND owner_id=%s
+        """, (video_id, user["id"])).fetchone()
+    if not row:
+        fail(404, "Видео не найдено")
+    return row
+
 
 @app.get("/api/videos/{video_id}", tags=["Видео"])
 def get_video(video_id: UUID, request: Request, response: Response, user=Depends(session_user)):
@@ -450,6 +486,8 @@ def preview(video_id: UUID, user=Depends(session_user)):
 
 def clean_deleted_media(video_id):
     with pool.connection() as db:
+        if not video_lock(db, video_id):
+            return False
         pending = db.execute("""
             SELECT video_id FROM pending_video_deletions WHERE video_id=%s FOR UPDATE
         """, (video_id,)).fetchone()
@@ -493,8 +531,9 @@ async def retry_media_cleanup():
             responses={202: {"description": "Видео удалено, файлы ожидают очистки"}})
 def delete_video(video_id: UUID, user=Depends(signed_in)):
     with pool.connection() as db:
-        owner_video(db, video_id, user)
-        db.execute("INSERT INTO pending_video_deletions (video_id) VALUES (%s)", (video_id,))
+        video = owner_video(db, video_id, user)
+        db.execute("INSERT INTO pending_video_deletions (video_id,reserved_bytes) VALUES (%s,%s)",
+                   (video_id, video["reserved_bytes"]))
         db.execute("DELETE FROM videos WHERE id=%s", (video_id,))
 
     # Commit the deletion before touching disk so a failed transaction leaves the files intact.
