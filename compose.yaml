@@ -18,6 +18,8 @@ services:
 
   app:
     build: .
+    logging:
+      driver: local
     restart: unless-stopped
     depends_on:
       db:

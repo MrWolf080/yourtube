@@ -88,3 +88,12 @@ CREATE TABLE IF NOT EXISTS upload_attempts (
     user_id bigint PRIMARY KEY REFERENCES accounts ON DELETE CASCADE,
     started_at timestamptz NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS auth_rate_limits (
+    scope text NOT NULL,
+    subject text NOT NULL,
+    attempts integer NOT NULL,
+    expires_at timestamptz NOT NULL,
+    PRIMARY KEY (scope, subject)
+);
+CREATE INDEX IF NOT EXISTS auth_rate_limits_expiry ON auth_rate_limits (expires_at);

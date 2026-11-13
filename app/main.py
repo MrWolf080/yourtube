@@ -19,8 +19,10 @@ from fastapi.staticfiles import StaticFiles
 from starlette.requests import ClientDisconnect
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
-from pydantic import BaseModel, StringConstraints
+from pydantic import BaseModel, StringConstraints, field_validator
 from starlette.concurrency import run_in_threadpool
+
+from app.auth_limits import audit, client_ip, enforce, password_slot
 
 ROOT = Path(__file__).resolve().parent
 MEDIA = Path(os.environ.get("MEDIA_DIR", "media")).resolve()
@@ -60,6 +62,11 @@ Body = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max
 class Credentials(BaseModel):
     handle: Handle
     password: Annotated[str, StringConstraints(min_length=8, max_length=128)]
+
+    @field_validator("handle", mode="before")
+    @classmethod
+    def normalize_handle(cls, value):
+        return value.strip().lower() if isinstance(value, str) else value
 
 class VideoInput(BaseModel):
     title: Title
@@ -135,28 +142,41 @@ def login_session(db, response, user):
                         secure=os.environ.get("COOKIE_SECURE") == "1", max_age=14 * 86400)
 
 @app.post("/api/register", tags=["Аккаунт"], status_code=201)
-def register(payload: Credentials, response: Response):
-    encoded = passwords.hash(payload.password)
+def register(payload: Credentials, request: Request, response: Response):
+    ip = client_ip(request)
+    enforce(pool, "register", ip, payload.handle)
+    with password_slot(ip, payload.handle):
+        encoded = passwords.hash(payload.password)
     with pool.connection() as db:
         user = db.execute("""
             INSERT INTO accounts (handle,password_hash) VALUES (%s,%s)
             ON CONFLICT DO NOTHING RETURNING id,handle,role
         """, (payload.handle, encoded)).fetchone()
         if not user:
+            audit("registration_conflict", ip, payload.handle, reason="handle_taken")
             fail(409, "Имя пользователя уже занято")
         login_session(db, response, user)
     return user
 
 @app.post("/api/login", tags=["Аккаунт"])
-def login(payload: Credentials, response: Response):
+def login(payload: Credentials, request: Request, response: Response):
+    ip = client_ip(request)
+    enforce(pool, "login", ip, payload.handle)
     with pool.connection() as db:
         user = db.execute("SELECT * FROM accounts WHERE handle=%s", (payload.handle,)).fetchone()
-        try:
-            if not user or not passwords.verify(user["password_hash"], payload.password):
-                fail(401, "Неверное имя пользователя или пароль")
-        except VerifyMismatchError:
-            fail(401, "Неверное имя пользователя или пароль")
-        user.pop("password_hash")
+
+    if user:
+        with password_slot(ip, payload.handle):
+            try:
+                passwords.verify(user["password_hash"], payload.password)
+            except VerifyMismatchError:
+                user = None
+    if not user:
+        audit("login_failed", ip, payload.handle, reason="invalid_credentials")
+        fail(401, "Неверное имя пользователя или пароль")
+
+    user.pop("password_hash")
+    with pool.connection() as db:
         login_session(db, response, user)
     return user
 
