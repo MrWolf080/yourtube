@@ -33,6 +33,7 @@ MEDIA_QUOTA = int(os.environ.get("MEDIA_QUOTA_BYTES", 20 * 1024**3))
 UPLOAD_SLOTS = 2
 UPLOAD_COOLDOWN = 60
 UPLOAD_RECEIVE_TIMEOUT = 300
+STALE_UPLOAD_AGE = 24 * 60 * 60
 UPLOAD_LOCK_NAMESPACE = 910207441
 CATEGORIES = ("Кино", "Природа", "Путешествия", "Музыка", "Технологии", "Другое")
 COOKIE = "yourtube_session"
@@ -56,6 +57,10 @@ async def lifespan(app):
                 size = sum(item.stat().st_size for item in (MEDIA / str(row[key])).glob("*") if item.is_file())
                 db.execute(f"UPDATE {table} SET reserved_bytes=%s WHERE {key}=%s AND reserved_bytes IS NULL",
                            (size, row[key]))
+    try:
+        await run_in_threadpool(sweep_temporary_uploads)
+    except Exception:
+        logging.getLogger("uvicorn.error").exception("Could not sweep temporary uploads at startup")
     cleanup = asyncio.create_task(retry_media_cleanup())
     try:
         yield
@@ -301,15 +306,34 @@ def enqueue_video(directory, video_id, metadata, size, user):
                 os.close(fd)
 
 
+def sweep_temporary_uploads():
+    cutoff = time.time() - STALE_UPLOAD_AGE
+    with pool.connection() as db:
+        # The same locks guard uploads across all application processes.
+        for slot in range(UPLOAD_SLOTS):
+            locked = db.execute(
+                "SELECT pg_try_advisory_xact_lock(%s,%s) AS locked",
+                (UPLOAD_LOCK_NAMESPACE, slot),
+            ).fetchone()["locked"]
+            if not locked:
+                return
+        for path in MEDIA.glob(".upload-*"):
+            try:
+                if not path.is_symlink() and path.is_dir() and path.stat().st_mtime < cutoff:
+                    shutil.rmtree(path)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                logging.getLogger("uvicorn.error").exception("Could not remove stale upload %s", path.name)
+
+
 def sweep_uploads():
+    sweep_temporary_uploads()
     cutoff = time.time() - 3600
     with pool.connection() as db:
         for path in MEDIA.iterdir():
             try:
                 if not path.is_dir() or path.stat().st_mtime >= cutoff:
-                    continue
-                if path.name.startswith(".upload-"):
-                    shutil.rmtree(path)
                     continue
                 try:
                     video_id = UUID(path.name)
@@ -522,6 +546,7 @@ async def retry_media_cleanup():
     while True:
         try:
             await run_in_threadpool(clean_pending_media)
+            await run_in_threadpool(sweep_temporary_uploads)
         except Exception:
             logging.getLogger("uvicorn.error").exception("Could not retry media cleanup")
         await asyncio.sleep(30)
