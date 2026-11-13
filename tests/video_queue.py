@@ -61,8 +61,8 @@ def main():
     other.register("queue_other")
     with TemporaryDirectory() as tmp:
         file = Path(tmp) / "test.mp4"
-        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=12",
-                        "-t", "2", "-c:v", "libx264", str(file)], check=True)
+        subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=853x480:rate=12",
+                        "-t", "2", "-c:v", "libx264rgb", str(file)], check=True)
         media = file.read_bytes()
 
     compose("stop", "worker")

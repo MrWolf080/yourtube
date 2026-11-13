@@ -35,7 +35,7 @@ def prepare_video(source, directory, run=None):
         run(ffmpeg + [
             "-protocol_whitelist", "file", "-threads", "2", "-i", str(source),
             "-map", f"0:{index}", "-map", "0:a:0?", "-map_metadata", "-1", "-map_chapters", "-1",
-            "-vf", "scale=w='min(1920,iw)':h=-2", "-pix_fmt", "yuv420p", "-c:v", "libx264",
+            "-vf", "scale=w='max(2,trunc(min(1920,iw)/2)*2)':h=-2", "-pix_fmt", "yuv420p", "-c:v", "libx264",
             "-preset", "veryfast", "-threads", "2", "-c:a", "aac", "-movflags", "+faststart",
             "-fs", str(MAX_OUTPUT), "-progress", "pipe:1", "-nostats", str(video),
         ], 900, seconds)
