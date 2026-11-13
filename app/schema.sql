@@ -68,3 +68,10 @@ CREATE TABLE IF NOT EXISTS reports (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_open_report ON reports (video_id, reporter_id) WHERE status = 'open';
+
+CREATE TABLE IF NOT EXISTS video_view_receipts (
+    video_id uuid NOT NULL REFERENCES videos ON DELETE CASCADE,
+    viewer text NOT NULL,
+    viewed_at timestamptz NOT NULL,
+    PRIMARY KEY (video_id, viewer)
+);

@@ -29,9 +29,25 @@ async function watch(id, current) {
     finally { button.disabled = false; }
   });
   subscription(v, current);
-  $("#player").addEventListener("playing", async () => {
-    try { const row = await api(url + "/views", "POST"); if (current()) $("#views").textContent = number(row.views); } catch { /* playback can continue */ }
-  }, {once:true});
+  const player = $("#player");
+  let reportingView = false;
+  async function reportView() {
+    if (reportingView || !Number.isFinite(player.duration) || player.duration <= 0) return;
+    let watched = 0;
+    for (let i = 0; i < player.played.length; i++) {
+      watched += player.played.end(i) - player.played.start(i);
+    }
+    if (watched < Math.min(3, player.duration / 2)) return;
+    reportingView = true;
+    try {
+      const row = await api(url + "/views", "POST");
+      if (current()) $("#views").textContent = number(row.views);
+      player.removeEventListener("timeupdate", reportView);
+    } catch {
+      reportingView = false;
+    }
+  }
+  player.addEventListener("timeupdate", reportView);
   bind("#save-video", "submit", async e => {
     e.preventDefault();
     const playlist = new FormData(e.target).get("playlist");

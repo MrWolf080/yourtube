@@ -25,6 +25,7 @@ MEDIA = Path(os.environ.get("MEDIA_DIR", "media")).resolve()
 LIMIT = int(os.environ.get("UPLOAD_MAX_BYTES", 512 * 1024**2))
 CATEGORIES = ("Кино", "Природа", "Путешествия", "Музыка", "Технологии", "Другое")
 COOKIE = "yourtube_session"
+VIEWER_COOKIE = "yourtube_viewer"
 cookie = APIKeyCookie(name=COOKIE, auto_error=False)
 passwords = PasswordHasher()
 pool = ConnectionPool(
@@ -290,7 +291,7 @@ async def upload(request: Request, title: Title, description: str = Query("", ma
     return {"id": video_id}
 
 @app.get("/api/videos/{video_id}", tags=["Видео"])
-def get_video(video_id: UUID, user=Depends(session_user)):
+def get_video(video_id: UUID, request: Request, response: Response, user=Depends(session_user)):
     uid = viewer_id(user)
     with pool.connection() as db:
         video = video_for(db, video_id, user)
@@ -300,17 +301,38 @@ def get_video(video_id: UUID, user=Depends(session_user)):
             (SELECT count(*) FROM subscriptions WHERE channel_id=%s) AS subscribers,
             EXISTS(SELECT 1 FROM subscriptions WHERE channel_id=%s AND user_id=%s) AS subscribed
         """, (video_id, video_id, uid, video["owner_id"], video["owner_id"], uid)).fetchone())
+        if not request.cookies.get(VIEWER_COOKIE):
+            response.set_cookie(VIEWER_COOKIE, secrets.token_urlsafe(32), httponly=True,
+                                samesite="lax", secure=os.environ.get("COOKIE_SECURE") == "1",
+                                max_age=365 * 86400)
         return video
 
 @app.post("/api/videos/{video_id}/views", tags=["Видео"])
-def count_view(video_id: UUID, user=Depends(session_user)):
-    uid = viewer_id(user)
+def count_view(video_id: UUID, request: Request, user=Depends(session_user)):
     with pool.connection() as db:
-        row = db.execute(f"UPDATE videos v SET views=views+1 WHERE v.id=%s AND {VISIBLE} RETURNING views",
-                         (video_id, uid, uid)).fetchone()
-        if not row:
+        video = video_for(db, video_id, user)
+        browser = request.cookies.get(VIEWER_COOKIE, "")
+        if not user and not 32 <= len(browser) <= 128:
+            return {"views": video["views"]}
+        viewer = f"user:{user['id']}" if user else f"browser:{digest(browser)}"
+        # Serialize eligibility and deduplication with concurrent updates to this video.
+        uid = viewer_id(user)
+        video = db.execute(f"""
+            SELECT v.views FROM videos v WHERE v.id=%s AND {VISIBLE} FOR UPDATE
+        """, (video_id, uid, uid)).fetchone()
+        if not video:
             fail(404, "Видео недоступно")
-        return row
+        counted = db.execute("""
+            INSERT INTO video_view_receipts (video_id, viewer, viewed_at) VALUES (%s,%s,now())
+            ON CONFLICT (video_id, viewer) DO UPDATE SET viewed_at=excluded.viewed_at
+            WHERE video_view_receipts.viewed_at <= excluded.viewed_at - interval '24 hours'
+            RETURNING video_id
+        """, (video_id, viewer)).fetchone()
+        if counted:
+            return db.execute("UPDATE videos SET views=views+1 WHERE id=%s RETURNING views",
+                              (video_id,)).fetchone()
+        return video
+
 
 def serve_media(video_id, user, filename, mime):
     with pool.connection() as db:
