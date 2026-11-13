@@ -23,7 +23,7 @@ from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, StringConstraints, field_validator
 from starlette.concurrency import run_in_threadpool
 
-from app.auth_limits import audit, client_ip, enforce, password_slot
+from app.auth_limits import audit, client_ip, enforce, password_slot, record_login_failure
 from app.video_processing import MAX_OUTPUT, MAX_PREVIEW
 
 ROOT = Path(__file__).resolve().parent
@@ -184,7 +184,7 @@ def login(payload: Credentials, request: Request, response: Response):
             except VerifyMismatchError:
                 user = None
     if not user:
-        audit("login_failed", ip, payload.handle, reason="invalid_credentials")
+        record_login_failure(pool, ip, payload.handle)
         fail(401, "Неверное имя пользователя или пароль")
 
     user.pop("password_hash")

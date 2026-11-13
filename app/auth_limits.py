@@ -10,7 +10,8 @@ from fastapi import HTTPException
 logger = logging.getLogger("uvicorn.error")
 
 LOGIN_IP = ("login_ip", 20, 300)
-LOGIN_ACCOUNT = ("login_account", 5, 300)
+LOGIN_IP_ACCOUNT = ("login_ip_account", 5, 300)
+ACCOUNT_FAILURES = ("login_account_failures", 10, 300)
 REGISTER_IP = ("register_ip", 5, 86400)
 AUTH_GLOBAL = ("auth_global", 120, 60)
 password_slots = BoundedSemaphore(2)
@@ -44,24 +45,25 @@ def consume(db, policy, key):
         RETURNING attempts
     """, (scope, key, seconds, limit)).fetchone()
     if accepted:
-        return None, accepted["attempts"] == 1
+        return None, accepted["attempts"]
     return db.execute("""
         SELECT greatest(1, ceil(extract(epoch FROM expires_at - clock_timestamp())))::integer AS seconds
         FROM auth_rate_limits WHERE scope=%s AND subject=%s
-    """, (scope, key)).fetchone()["seconds"], False
+    """, (scope, key)).fetchone()["seconds"], None
 
 
 def enforce(pool, action, ip, handle):
-    policies = [(REGISTER_IP if action == "register" else LOGIN_IP, ip), (AUTH_GLOBAL, "*")]
+    policies = [(REGISTER_IP if action == "register" else LOGIN_IP, ip)]
     if action == "login":
-        policies.append((LOGIN_ACCOUNT, handle))
+        policies.append((LOGIN_IP_ACCOUNT, f"{ip}/{handle}"))
+    policies.append((AUTH_GLOBAL, "*"))
 
     cleanup = False
     with pool.connection() as db:
         for policy, key in policies:
-            retry_after, opened_window = consume(db, policy, key)
+            retry_after, attempts = consume(db, policy, key)
             if policy == AUTH_GLOBAL:
-                cleanup = opened_window
+                cleanup = attempts == 1
             if retry_after is not None:
                 break
     if cleanup:
@@ -81,6 +83,14 @@ def enforce(pool, action, ip, handle):
     raise HTTPException(429, "Слишком много попыток. Повторите позже.",
                         headers={"Retry-After": str(retry_after)})
 
+
+
+def record_login_failure(pool, ip, handle):
+    audit("login_failed", ip, handle, reason="invalid_credentials")
+    with pool.connection() as db:
+        _, attempts = consume(db, ACCOUNT_FAILURES, handle)
+    if attempts == ACCOUNT_FAILURES[1]:
+        audit("account_failure_spike", ip, handle, reason="too_many_failed_logins")
 
 
 @contextmanager
