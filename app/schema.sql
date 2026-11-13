@@ -97,3 +97,8 @@ CREATE TABLE IF NOT EXISTS auth_rate_limits (
     PRIMARY KEY (scope, subject)
 );
 CREATE INDEX IF NOT EXISTS auth_rate_limits_expiry ON auth_rate_limits (expires_at);
+
+CREATE TABLE IF NOT EXISTS pending_video_deletions (
+    video_id uuid PRIMARY KEY,
+    last_attempt_at timestamptz NOT NULL DEFAULT now()
+);

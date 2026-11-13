@@ -151,12 +151,29 @@ async function manage(id, current) {
   const access = owned.users;
   if (!current()) return;
   main.innerHTML = `<div class="page-heading"><div><h1>Управление видео</h1><p>${esc(v.title)}${v.hidden ? " · Скрыто модератором" : ""}</p></div>
-    ${!v.hidden ? `<a data-nav class="button" href="/watch/${id}">Смотреть</a>` : ""}</div>
+    <div class="inline">
+      ${!v.hidden ? `<a data-nav class="button" href="/watch/${id}">Смотреть</a>` : ""}
+      <button type="button" id="delete-video" class="button danger">Удалить видео</button>
+    </div></div>
     <form id="edit" class="panel stack form-wide">${metaFields(v)}<button class="button primary">Сохранить</button></form>
     <section class="panel form-wide access"><h2>Доступ к приватному видео</h2>
       <form id="grant" class="inline"><label>Имя пользователя<input name="handle" pattern="[A-Za-z0-9_]{3,30}" required></label><button class="button">Разрешить</button></form>
       <div id="grants">${access.map(a => `<div class="access-row"><span>@${esc(a.handle)}</span><button class="button revoke" data-handle="${esc(a.handle)}">Отозвать</button></div>`).join("")}</div>
     </section>`;
+  bind("#delete-video", "click", async e => {
+    if (!confirm("Удалить видео и связанные комментарии? Это действие нельзя отменить.")) return;
+    const button = e.currentTarget;
+    button.disabled = true;
+    try {
+      await api(url, "DELETE");
+      if (current()) {
+        toast("Видео удалено");
+        go("/mine", true);
+      }
+    } finally {
+      button.disabled = false;
+    }
+  });
   bind("#edit", "submit", async e => {
     e.preventDefault();
     await api(url, "PATCH", metadata(e.target)); toast("Изменения сохранены"); if (current()) render();

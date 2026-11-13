@@ -1,8 +1,10 @@
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import secrets
+import shutil
 import subprocess
 import tempfile
 from contextlib import asynccontextmanager
@@ -47,9 +49,12 @@ async def lifespan(app):
     pool.open(wait=True)
     with pool.connection() as db:
         db.execute((ROOT / "schema.sql").read_text(encoding="utf-8"))
+    cleanup = asyncio.create_task(retry_media_cleanup())
     try:
         yield
     finally:
+        cleanup.cancel()
+        await asyncio.gather(cleanup, return_exceptions=True)
         pool.close()
 
 app = FastAPI(title="YourTube API", lifespan=lifespan)
@@ -443,6 +448,59 @@ def stream(video_id: UUID, user=Depends(session_user)):
 def preview(video_id: UUID, user=Depends(session_user)):
     return serve_media(video_id, user, "preview.jpg", "image/jpeg")
 
+def clean_deleted_media(video_id):
+    with pool.connection() as db:
+        pending = db.execute("""
+            SELECT video_id FROM pending_video_deletions WHERE video_id=%s FOR UPDATE
+        """, (video_id,)).fetchone()
+        if not pending:
+            return True
+        directory = MEDIA / str(video_id)
+        try:
+            if directory.is_symlink():
+                directory.unlink()
+            else:
+                shutil.rmtree(directory)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            logging.getLogger("uvicorn.error").exception("Media cleanup failed for %s", video_id)
+            db.execute("UPDATE pending_video_deletions SET last_attempt_at=now() WHERE video_id=%s", (video_id,))
+            return False
+        db.execute("DELETE FROM pending_video_deletions WHERE video_id=%s", (video_id,))
+        return True
+
+
+def clean_pending_media():
+    with pool.connection() as db:
+        pending = db.execute("""
+            SELECT video_id FROM pending_video_deletions ORDER BY last_attempt_at,video_id LIMIT 20
+        """).fetchall()
+    for row in pending:
+        clean_deleted_media(row["video_id"])
+
+
+async def retry_media_cleanup():
+    while True:
+        try:
+            await run_in_threadpool(clean_pending_media)
+        except Exception:
+            logging.getLogger("uvicorn.error").exception("Could not retry media cleanup")
+        await asyncio.sleep(30)
+
+
+@app.delete("/api/videos/{video_id}", tags=["Видео"], status_code=204,
+            responses={202: {"description": "Видео удалено, файлы ожидают очистки"}})
+def delete_video(video_id: UUID, user=Depends(signed_in)):
+    with pool.connection() as db:
+        owner_video(db, video_id, user)
+        db.execute("INSERT INTO pending_video_deletions (video_id) VALUES (%s)", (video_id,))
+        db.execute("DELETE FROM videos WHERE id=%s", (video_id,))
+
+    # Commit the deletion before touching disk so a failed transaction leaves the files intact.
+    return Response(status_code=204 if clean_deleted_media(video_id) else 202)
+
+
 @app.patch("/api/videos/{video_id}", tags=["Видео"])
 def edit_video(video_id: UUID, payload: VideoInput, user=Depends(signed_in)):
     with pool.connection() as db:
@@ -661,5 +719,6 @@ def change_role(handle: Handle, payload: RoleInput, user=Depends(admin)):
 @app.get("/history", include_in_schema=False)
 @app.get("/moderation", include_in_schema=False)
 def frontend():
-    return FileResponse(ROOT / "static" / "index.html", media_type="text/html")
+    return FileResponse(ROOT / "static" / "index.html", media_type="text/html",
+                        headers={"Cache-Control": "no-cache"})
 

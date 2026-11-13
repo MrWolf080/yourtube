@@ -69,6 +69,8 @@ def seed_demo_data(db):
     video_ids = []
     for index, (owner, title, category, pattern, seconds, private) in enumerate(VIDEOS, 1):
         video_id = demo_video_id(index)
+        if db.execute("SELECT 1 FROM pending_video_deletions WHERE video_id=%s", (video_id,)).fetchone():
+            raise RuntimeError("Дождитесь завершения удаления файлов тестового ролика.")
         db.execute("""
             INSERT INTO videos (id, owner_id, title, description, category, private, duration, created_at)
             VALUES (%s,%s,%s,%s,%s,%s,%s,now() - make_interval(days => %s))
