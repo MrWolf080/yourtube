@@ -7,3 +7,5 @@ __pycache__/
 .deploy.lock
 media/
 PROMPTS.md
+/postgres_data/
+/video_data/

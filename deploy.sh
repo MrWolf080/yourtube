@@ -51,6 +51,8 @@ if [[ ! -e .env ]]; then
     mv -T -- "$secret_file" .env
 fi
 
+install -d -o 10001 -g 10001 -m 0750 -- video_data
+
 compose=("${docker[@]}" compose --env-file .env)
 if ! "${compose[@]}" up -d --build --wait --wait-timeout 120; then
     "${compose[@]}" logs --tail 30 >&2
